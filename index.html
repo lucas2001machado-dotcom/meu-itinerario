@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Meu GPS — Rotas e Voz</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{color-scheme:dark;--bg:#101318;--panel:#1b2028;--text:#f3f5f7;--muted:#aeb6c2;--accent:#ff795e;--line:#353d49}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px system-ui,-apple-system,Segoe UI,sans-serif}
+header{padding:16px;background:#171b22;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:500}
+h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:var(--muted);font-size:13px}
+main{padding:12px;max-width:850px;margin:auto}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,.filelabel{border:0;border-radius:10px;background:var(--accent);color:#1b1110;font-weight:700;padding:12px 14px;font-size:15px;cursor:pointer}
+button.secondary,.filelabel.secondary{background:#2b333f;color:var(--text);border:1px solid #465160}
+button:disabled{opacity:.45;cursor:not-allowed}input[type=file]{display:none}
+#map{height:48vh;min-height:300px;border-radius:12px;overflow:hidden;background:#252b34}
+#status{font-weight:650;margin-bottom:6px}#detail{font-size:14px;color:var(--muted);line-height:1.5}
+.statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}.stat{background:#11151b;border-radius:10px;padding:10px}.stat b{display:block;font-size:18px}.stat span{color:var(--muted);font-size:12px}
+.small{font-size:13px;color:var(--muted);line-height:1.45}.warning{color:#ffd49a}#routeName{width:100%;background:#11151b;color:white;border:1px solid var(--line);padding:11px;border-radius:9px;margin-top:8px}
+@media(max-width:420px){button,.filelabel{flex:1;text-align:center}.statgrid{grid-template-columns:repeat(3,1fr)}}
+</style>
+</head>
+<body>
+<header><h1>🏍️ Meu GPS — Rotas e Voz</h1><p>Carregue um arquivo GPX e acompanhe sua posição na rota.</p></header>
+<main>
+<section class="panel">
+<div class="row">
+<label class="filelabel" for="gpxFile">📂 Carregar GPX</label><input id="gpxFile" type="file" accept=".gpx,application/gpx+xml,application/xml,text/xml">
+<button id="startBtn">▶ Iniciar GPS</button>
+<button id="stopBtn" class="secondary" disabled>■ Parar</button>
+<button id="voiceBtn" class="secondary">🔊 Testar voz</button>
+</div>
+<input id="routeName" readonly value="Nenhuma rota carregada" aria-label="Nome da rota">
+<p id="status">Pronto para começar.</p><div id="detail">1. Carregue seu arquivo GPX. 2. Permita o acesso à localização. 3. Toque em “Iniciar GPS”.</div>
+<div class="statgrid">
+<div class="stat"><b id="speed">—</b><span>Velocidade km/h</span></div>
+<div class="stat"><b id="distance">—</b><span>Distância da rota</span></div>
+<div class="stat"><b id="accuracy">—</b><span>Precisão GPS</span></div>
+</div>
+</section>
+<section class="panel"><div id="map"></div><p class="small">O app acompanha o trajeto do GPX e avisa por voz quando você estiver longe da linha da rota. Ele não calcula novas ruas nem substitui um navegador com instruções curva a curva.</p></section>
+<section class="panel"><b>Se o GPS não iniciar</b><p class="small">Abra o site publicado por HTTPS, ligue a localização do celular e permita a localização para o Chrome. Arquivos locais abertos como “file://” podem bloquear o GPS. A internet é necessária para carregar o mapa.</p></section>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const status = $('status'), detail = $('detail');
+let map, routeLayer, userMarker, accuracyCircle, watchId=null, routePoints=[], lastOffRoute=0, lastSpoken='', lastPosition=null;
+const mapEl = $('map');
+function setStatus(s,d=''){status.textContent=s;detail.textContent=d}
+function speak(text){
+  if(!('speechSynthesis' in window)){setStatus('Voz não suportada neste navegador.','Tente abrir no Google Chrome atualizado.');return}
+  window.speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);u.lang='pt-BR';u.rate=1;window.speechSynthesis.speak(u);
+}
+function initMap(){
+ if(map) return;
+ map=L.map('map').setView([-27.1,-52.6],12);
+ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(map);
+}
+initMap();
+$('voiceBtn').addEventListener('click',()=>speak('Teste de voz. Meu GPS está pronto.'));
+$('gpxFile').addEventListener('change', async e=>{
+ const file=e.target.files[0]; if(!file)return;
+ try{
+  const xml=new DOMParser().parseFromString(await file.text(),'application/xml');
+  if(xml.querySelector('parsererror')) throw new Error('O arquivo GPX não pôde ser lido.');
+  const pts=[...xml.getElementsByTagName('trkpt'),...xml.getElementsByTagName('rtept')];
+  routePoints=pts.map(p=>({lat:Number(p.getAttribute('lat')),lng:Number(p.getAttribute('lon'))})).filter(p=>Number.isFinite(p.lat)&&Number.isFinite(p.lng));
+  if(routePoints.length<2) throw new Error('Não encontrei pontos suficientes. Use um GPX com trilha (trk) ou rota (rte).');
+  if(routeLayer)map.removeLayer(routeLayer);
+  routeLayer=L.polyline(routePoints,{color:'#ff684d',weight:5,opacity:.9}).addTo(map);
+  map.fitBounds(routeLayer.getBounds(),{padding:[24,24]});
+  $('routeName').value=file.name;
+  setStatus('Rota carregada: '+routePoints.length+' pontos.','Agora toque em “Iniciar GPS” e permita a localização.');
+  speak('Rota carregada. Toque em iniciar GPS quando estiver pronto.');
+ }catch(err){routePoints=[];setStatus('Erro ao carregar GPX.',err.message)}
+});
+function haversine(a,b){
+ const R=6371000, rad=x=>x*Math.PI/180, dLat=rad(b.lat-a.lat),dLon=rad(b.lng-a.lng);
+ const x=Math.sin(dLat/2)**2+Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLon/2)**2;
+ return 2*R*Math.asin(Math.sqrt(x));
+}
+function nearestDistance(p){
+ if(!routePoints.length)return null;
+ let min=Infinity;
+ // Check every 2nd point for long GPX files, while always checking endpoints.
+ const step=routePoints.length>3000?Math.ceil(routePoints.length/1500):1;
+ for(let i=0;i<routePoints.length;i+=step)min=Math.min(min,haversine(p,routePoints[i]));
+ min=Math.min(min,haversine(p,routePoints[routePoints.length-1]));
+ return min;
+}
+function onPosition(pos){
+ const p={lat:pos.coords.latitude,lng:pos.coords.longitude};
+ const acc=pos.coords.accuracy;
+ $('accuracy').textContent=Number.isFinite(acc)?Math.round(acc)+' m':'—';
+ $('speed').textContent=pos.coords.speed!=null&&pos.coords.speed>=0?Math.round(pos.coords.speed*3.6):'—';
+ if(!userMarker){userMarker=L.circleMarker(p,{radius:9,color:'#fff',weight:3,fillColor:'#238bff',fillOpacity:1}).addTo(map);map.setView(p,16)}
+ else userMarker.setLatLng(p);
+ if(accuracyCircle)map.removeLayer(accuracyCircle);
+ accuracyCircle=L.circle(p,{radius:Math.min(acc||25,150),color:'#238bff',weight:1,fillOpacity:.06}).addTo(map);
+ if(routePoints.length){
+  const d=nearestDistance(p);$('distance').textContent=d<1000?Math.round(d)+' m':(d/1000).toFixed(1)+' km';
+  if(d>100 && Date.now()-lastOffRoute>45000){lastOffRoute=Date.now();speak('Atenção. Você está a mais de cem metros da rota carregada.');setStatus('Você parece estar fora da rota.','Distância aproximada até o ponto mais próximo do GPX: '+Math.round(d)+' metros.')}
+  else if(d<=100){setStatus('GPS ativo — você está perto da rota.','Posição atualizada. Mantenha o celular fixo e não mexa nele enquanto pilota.')}
+ }else{$('distance').textContent='Sem GPX';setStatus('GPS ativo.','Sua localização aparece no mapa, mas carregue um GPX para acompanhar uma rota.')}
+ lastPosition=p;
+}
+function onError(err){
+ const messages={1:'Permissão de localização negada. No Chrome, permita Localização para este site.',2:'O celular não conseguiu obter sua posição. Confira se a localização está ligada.',3:'O GPS demorou demais. Tente novamente em local aberto.'};
+ setStatus('Não foi possível iniciar o GPS.',messages[err.code]||err.message||'Confira as permissões de localização.');
+}
+$('startBtn').addEventListener('click',()=>{
+ if(!window.isSecureContext){setStatus('Este endereço não é seguro para usar GPS.','Publique/abra o projeto por HTTPS (por exemplo, GitHub Pages).');return}
+ if(!navigator.geolocation){setStatus('Geolocalização não disponível.','Abra no Google Chrome atualizado.');return}
+ if(watchId!==null)return;
+ setStatus('Solicitando localização…','Quando o Chrome perguntar, toque em Permitir. Pode levar alguns segundos.');
+ watchId=navigator.geolocation.watchPosition(onPosition,onError,{enableHighAccuracy:true,maximumAge:1000,timeout:20000});
+ $('startBtn').disabled=true;$('stopBtn').disabled=false;
+});
+$('stopBtn').addEventListener('click',()=>{
+ if(watchId!==null)navigator.geolocation.clearWatch(watchId);
+ watchId=null;$('startBtn').disabled=false;$('stopBtn').disabled=true;
+ setStatus('GPS pausado.','Toque em “Iniciar GPS” para retomar.');
+});
+window.addEventListener('resize',()=>{if(map)setTimeout(()=>map.invalidateSize(),150)});
+})();
+</script>
+</body>
+</html>
